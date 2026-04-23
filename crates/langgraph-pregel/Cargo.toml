@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 langgraph-core = { path = "../langgraph-core" }
+langgraph-checkpoint = { path = "../langgraph-checkpoint" }
 serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 insta = "1"

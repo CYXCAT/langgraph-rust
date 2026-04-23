@@ -20,4 +20,6 @@ pub enum GraphError {
     DidNotReachFinish(String),
     #[error("node `{node}` failed: {reason}")]
     NodeExecutionFailed { node: String, reason: String },
+    #[error("channel `{field}` merge failed: {reason}")]
+    ChannelMergeFailed { field: String, reason: String },
 }

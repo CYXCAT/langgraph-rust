@@ -12,6 +12,11 @@ Rust 版 LangGraph 迁移的最小可运行骨架，原项目地址：https://gi
 - [x] 统一错误类型 `GraphError` 与 `StateValue`
 - [x] `CheckpointSaver` trait 草案 + `InMemorySaver`
 - [x] `tests/compat/` 第一批 fixture
+- [x] channel 抽象（`LastValue` / `BinaryOperatorAggregate` / `Topic`）与 superstep 执行
+- [x] `versions_seen` / channel versioning 元数据链路
+- [x] checkpoint 恢复闭环（`resume` / `resume_latest` / `pending_writes` materialize）
+- [x] 显式中断与恢复（`interrupt_thread`）
+- [x] `resume_latest` 最新 checkpoint 选择修复（按数值版本，不依赖返回顺序）
 
 ## 目录
 
@@ -22,6 +27,6 @@ Rust 版 LangGraph 迁移的最小可运行骨架，原项目地址：https://gi
 
 ## 下一步
 
-1. 在 `langgraph-core` 增加 `add_conditional_edges` 与分支模型
-2. 在 checkpoint 保存中接入执行器版本元数据（`versions_seen`）
-3. 为 checkpoint 增加 thread 多轮执行与恢复集成测试
+1. 进入 Phase 4：实现 `Command` / `interrupt` 语义与 runtime context 注入
+2. 在 `langgraph-core` 增加 `add_conditional_edges` 与分支路由模型
+3. 进入 Phase 5：补齐 async/streaming（`ainvoke` / `astream`）

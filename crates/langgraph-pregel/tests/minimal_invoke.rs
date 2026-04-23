@@ -108,7 +108,7 @@ fn invoke_supports_branch_merge_with_channel_aggregate() {
 }
 
 #[test]
-fn invoke_uses_last_value_channel_in_same_superstep() {
+fn invoke_last_value_channel_rejects_multiple_writes_in_same_superstep() {
     let mut graph = StateGraph::new();
     graph.add_node("start", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
     graph
@@ -134,8 +134,45 @@ fn invoke_uses_last_value_channel_in_same_superstep() {
     graph.add_channel("status", Arc::new(LastValue));
 
     let compiled = graph.compile().unwrap();
+    let err = SequentialExecutor.invoke(&compiled, BTreeMap::new()).unwrap_err();
+    assert!(matches!(err, GraphError::ChannelMergeFailed { field, .. } if field == "status"));
+}
+
+#[test]
+fn invoke_does_not_exit_early_when_finish_is_parallel_with_other_work() {
+    let mut graph = StateGraph::new();
+    graph.add_node("start", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph
+        .add_node(
+            "slow_1",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("trail"), json!("slow_1"))]))),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "slow_2",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("trail"), json!("slow_2"))]))),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "finish",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("done"), json!(true))]))),
+        )
+        .unwrap();
+
+    graph.add_edge("start", "finish").unwrap();
+    graph.add_edge("start", "slow_1").unwrap();
+    graph.add_edge("slow_1", "slow_2").unwrap();
+    graph.add_edge("slow_2", "finish").unwrap();
+    graph.set_entry_point("start");
+    graph.set_finish_point("finish");
+    graph.add_channel("trail", Arc::new(langgraph_core::Topic));
+
+    let compiled = graph.compile().unwrap();
     let final_state = SequentialExecutor.invoke(&compiled, BTreeMap::new()).unwrap();
-    assert_eq!(final_state.get("status"), Some(&json!("b")));
+    assert_eq!(final_state.get("done"), Some(&json!(true)));
+    assert_eq!(final_state.get("trail"), Some(&json!(["slow_1", "slow_2"])));
 }
 
 #[test]

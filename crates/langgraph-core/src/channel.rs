@@ -5,18 +5,21 @@ use serde_json::Value;
 pub type ChannelRef = Arc<dyn Channel>;
 
 pub trait Channel: Send + Sync {
-    fn merge(&self, current: Option<&Value>, incoming: Vec<Value>) -> Value;
+    fn merge(&self, current: Option<&Value>, incoming: Vec<Value>) -> Result<Value, String>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LastValue;
 
 impl Channel for LastValue {
-    fn merge(&self, current: Option<&Value>, incoming: Vec<Value>) -> Value {
-        if let Some(last) = incoming.into_iter().last() {
-            return last;
+    fn merge(&self, current: Option<&Value>, incoming: Vec<Value>) -> Result<Value, String> {
+        if incoming.len() > 1 {
+            return Err("multiple writes in same superstep are not allowed".to_string());
         }
-        current.cloned().unwrap_or(Value::Null)
+        if let Some(last) = incoming.into_iter().last() {
+            return Ok(last);
+        }
+        Ok(current.cloned().unwrap_or(Value::Null))
     }
 }
 
@@ -35,15 +38,15 @@ impl BinaryOperatorAggregate {
 }
 
 impl Channel for BinaryOperatorAggregate {
-    fn merge(&self, current: Option<&Value>, incoming: Vec<Value>) -> Value {
+    fn merge(&self, current: Option<&Value>, incoming: Vec<Value>) -> Result<Value, String> {
         let mut iter = incoming.into_iter();
         let Some(first) = iter.next() else {
-            return current.cloned().unwrap_or(Value::Null);
+            return Ok(current.cloned().unwrap_or(Value::Null));
         };
 
         let seed = if let Some(existing) = current { (self.op)(existing, &first) } else { first };
 
-        iter.fold(seed, |acc, item| (self.op)(&acc, &item))
+        Ok(iter.fold(seed, |acc, item| (self.op)(&acc, &item)))
     }
 }
 
@@ -51,14 +54,14 @@ impl Channel for BinaryOperatorAggregate {
 pub struct Topic;
 
 impl Channel for Topic {
-    fn merge(&self, current: Option<&Value>, incoming: Vec<Value>) -> Value {
+    fn merge(&self, current: Option<&Value>, incoming: Vec<Value>) -> Result<Value, String> {
         let mut items = match current {
             Some(Value::Array(existing)) => existing.clone(),
             Some(other) => vec![other.clone()],
             None => Vec::new(),
         };
         items.extend(incoming);
-        Value::Array(items)
+        Ok(Value::Array(items))
     }
 }
 
@@ -69,10 +72,17 @@ mod tests {
     use super::{BinaryOperatorAggregate, Channel, LastValue, Topic};
 
     #[test]
-    fn last_value_keeps_latest_write() {
+    fn last_value_allows_single_write() {
         let channel = LastValue;
-        let merged = channel.merge(Some(&json!("old")), vec![json!("a"), json!("b")]);
-        assert_eq!(merged, json!("b"));
+        let merged = channel.merge(Some(&json!("old")), vec![json!("a")]).unwrap();
+        assert_eq!(merged, json!("a"));
+    }
+
+    #[test]
+    fn last_value_rejects_multiple_writes_in_same_step() {
+        let channel = LastValue;
+        let err = channel.merge(Some(&json!("old")), vec![json!("a"), json!("b")]).unwrap_err();
+        assert!(err.contains("multiple writes"));
     }
 
     #[test]
@@ -80,14 +90,14 @@ mod tests {
         let channel = BinaryOperatorAggregate::new(std::sync::Arc::new(|left, right| {
             json!(left.as_i64().unwrap_or_default() + right.as_i64().unwrap_or_default())
         }));
-        let merged = channel.merge(Some(&json!(3)), vec![json!(4), json!(5)]);
+        let merged = channel.merge(Some(&json!(3)), vec![json!(4), json!(5)]).unwrap();
         assert_eq!(merged, json!(12));
     }
 
     #[test]
     fn topic_appends_incoming_values() {
         let channel = Topic;
-        let merged = channel.merge(Some(&json!(["a"])), vec![json!("b"), json!("c")]);
+        let merged = channel.merge(Some(&json!(["a"])), vec![json!("b"), json!("c")]).unwrap();
         assert_eq!(merged, json!(["a", "b", "c"]));
     }
 }

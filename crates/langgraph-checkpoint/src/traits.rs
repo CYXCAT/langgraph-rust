@@ -17,5 +17,8 @@ pub trait CheckpointSaver: Send + Sync {
         thread_id: &str,
         checkpoint_id: &str,
     ) -> Result<Option<Checkpoint>, CheckpointError>;
+    /// Returns checkpoints for a thread.
+    ///
+    /// Order is backend-defined and MUST NOT be relied on by callers.
     fn list(&self, thread_id: &str) -> Result<Vec<Checkpoint>, CheckpointError>;
 }

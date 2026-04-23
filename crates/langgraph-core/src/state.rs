@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::channel::ChannelRef;
+use crate::error::GraphError;
 
 pub type StateValue = Value;
 pub type State = BTreeMap<String, StateValue>;
@@ -30,7 +31,7 @@ pub fn apply_writes(
     writes: Vec<StatePatch>,
     reducers: &BTreeMap<String, ReducerFn>,
     channels: &BTreeMap<String, ChannelRef>,
-) {
+) -> Result<(), GraphError> {
     let mut ignored_channel_versions = VersionMap::new();
     let mut ignored_versions_seen = VersionMap::new();
     apply_writes_with_versions(
@@ -40,7 +41,7 @@ pub fn apply_writes(
         channels,
         &mut ignored_channel_versions,
         &mut ignored_versions_seen,
-    );
+    )
 }
 
 pub fn apply_writes_with_versions(
@@ -50,7 +51,7 @@ pub fn apply_writes_with_versions(
     channels: &BTreeMap<String, ChannelRef>,
     channel_versions: &mut VersionMap,
     versions_seen: &mut VersionMap,
-) {
+) -> Result<(), GraphError> {
     let mut grouped: BTreeMap<String, Vec<StateValue>> = BTreeMap::new();
     for patch in writes {
         for (key, value) in patch {
@@ -60,7 +61,12 @@ pub fn apply_writes_with_versions(
 
     for (key, incoming_values) in grouped {
         if let Some(channel) = channels.get(&key) {
-            let merged = channel.merge(state.get(&key), incoming_values);
+            let merged = channel
+                .merge(state.get(&key), incoming_values)
+                .map_err(|reason| GraphError::ChannelMergeFailed {
+                    field: key.clone(),
+                    reason,
+                })?;
             bump_channel_version(channel_versions, versions_seen, &key);
             state.insert(key, merged);
             continue;
@@ -86,6 +92,7 @@ pub fn apply_writes_with_versions(
             state.insert(key, last);
         }
     }
+    Ok(())
 }
 
 fn bump_channel_version(

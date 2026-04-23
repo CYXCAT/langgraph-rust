@@ -29,12 +29,21 @@ impl SequentialExecutor {
     pub fn invoke_with_metadata(
         &self,
         graph: &CompiledGraph,
+        state: State,
+    ) -> Result<ExecutionResult, GraphError> {
+        self.invoke_with_metadata_from_versions(graph, state, VersionMap::new())
+    }
+
+    pub fn invoke_with_metadata_from_versions(
+        &self,
+        graph: &CompiledGraph,
         mut state: State,
+        initial_versions: VersionMap,
     ) -> Result<ExecutionResult, GraphError> {
         let mut active = BTreeSet::from([graph.entry_point.clone()]);
         let mut step_count = 0usize;
-        let mut channel_versions = VersionMap::new();
-        let mut versions_seen = VersionMap::new();
+        let mut channel_versions = initial_versions.clone();
+        let mut versions_seen = initial_versions;
         const MAX_STEPS: usize = 10_000;
 
         while !active.is_empty() {
@@ -70,9 +79,9 @@ impl SequentialExecutor {
                 &graph.channels,
                 &mut channel_versions,
                 &mut versions_seen,
-            );
+            )?;
 
-            if active.contains(&graph.finish_point) {
+            if active.contains(&graph.finish_point) && next_active.is_empty() {
                 return Ok(ExecutionResult {
                     state,
                     metadata: ExecutionMetadata {
