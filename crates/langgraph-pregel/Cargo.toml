@@ -13,6 +13,7 @@ thiserror.workspace = true
 [dev-dependencies]
 insta = "1"
 criterion = "0.5"
+tokio = { version = "1", features = ["macros", "rt"] }
 
 [[bench]]
 name = "sequential_executor"

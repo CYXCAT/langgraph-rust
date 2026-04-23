@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use langgraph_core::{BinaryOperatorAggregate, GraphError, LastValue, StateGraph};
-use langgraph_pregel::SequentialExecutor;
+use langgraph_core::{
+    BinaryOperatorAggregate, Command, GraphError, LastValue, NodeOutput, RuntimeContext, StateGraph,
+};
+use langgraph_pregel::{CommandPolicy, SequentialExecutor, StreamEvent};
 use serde_json::json;
 
 #[test]
@@ -307,4 +309,489 @@ fn topic_channel_appends_across_rounds_with_snapshot_consistency() {
     assert_eq!(final_state.get("seen_by_a"), Some(&json!(1)));
     assert_eq!(final_state.get("seen_by_b"), Some(&json!(1)));
     assert_eq!(final_state.get("seen_by_collector"), Some(&json!(3)));
+}
+
+#[test]
+fn invoke_with_runtime_context_injects_read_only_values_to_nodes() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node_with_runtime(
+            "start",
+            Arc::new(|_state, runtime_context| {
+                let tenant = runtime_context
+                    .get("tenant")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                Ok(NodeOutput::from_patch(BTreeMap::from([(
+                    String::from("tenant"),
+                    json!(tenant),
+                )])))
+            }),
+        )
+        .unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("start", "finish").unwrap();
+    graph.set_entry_point("start");
+    graph.set_finish_point("finish");
+
+    let compiled = graph.compile().unwrap();
+    let runtime_context = RuntimeContext::from([(String::from("tenant"), json!("acme"))]);
+    let result = SequentialExecutor
+        .invoke_with_runtime_context(&compiled, BTreeMap::new(), runtime_context)
+        .unwrap();
+
+    assert_eq!(result.interrupt, None);
+    assert_eq!(result.state.get("tenant"), Some(&json!("acme")));
+}
+
+#[test]
+fn invoke_with_runtime_context_supports_interrupt_command() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node_with_runtime(
+            "gate",
+            Arc::new(|_state, _context| {
+                Ok(NodeOutput::interrupt(BTreeMap::from([(
+                    String::from("status"),
+                    json!("paused"),
+                )])))
+            }),
+        )
+        .unwrap();
+    graph.set_entry_point("gate");
+    graph.set_finish_point("gate");
+
+    let compiled = graph.compile().unwrap();
+    let result =
+        SequentialExecutor.invoke_with_runtime_context(&compiled, BTreeMap::new(), BTreeMap::new()).unwrap();
+
+    assert_eq!(result.state.get("status"), Some(&json!("paused")));
+    assert_eq!(result.interrupt.as_ref().map(|signal| signal.node.as_str()), Some("gate"));
+    assert_eq!(result.interrupt.as_ref().map(|signal| signal.superstep), Some(1));
+
+    let interrupted = SequentialExecutor.invoke_with_metadata(&compiled, BTreeMap::new()).unwrap_err();
+    assert!(matches!(interrupted, GraphError::Interrupted { node } if node == "gate"));
+}
+
+#[test]
+fn invoke_supports_conditional_edges_routing() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node(
+            "router",
+            Arc::new(|state| {
+                let route = state
+                    .get("route")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("left");
+                Ok(BTreeMap::from([(String::from("route"), json!(route))]))
+            }),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "left",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("picked"), json!("L"))]))),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "right",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("picked"), json!("R"))]))),
+        )
+        .unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("left", "finish").unwrap();
+    graph.add_edge("right", "finish").unwrap();
+    graph.add_conditional_edges(
+        "router",
+        ["left", "right"],
+        Arc::new(|state, _context| {
+            let route = state
+                .get("route")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("left");
+            Ok(vec![route.to_string()])
+        }),
+    );
+    graph.set_entry_point("router");
+    graph.set_finish_point("finish");
+
+    let compiled = graph.compile().unwrap();
+    let initial = BTreeMap::from([(String::from("route"), json!("right"))]);
+    let final_state = SequentialExecutor.invoke(&compiled, initial).unwrap();
+    assert_eq!(final_state.get("picked"), Some(&json!("R")));
+}
+
+#[test]
+fn invoke_command_goto_overrides_conditional_route() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node_with_runtime(
+            "router",
+            Arc::new(|_state, _context| Ok(NodeOutput::goto(BTreeMap::new(), "right"))),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "left",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("picked"), json!("L"))]))),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "right",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("picked"), json!("R"))]))),
+        )
+        .unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("left", "finish").unwrap();
+    graph.add_edge("right", "finish").unwrap();
+    graph.add_conditional_edges(
+        "router",
+        ["left", "right"],
+        Arc::new(|_state, _context| Ok(vec![String::from("left")])),
+    );
+    graph.set_entry_point("router");
+    graph.set_finish_point("finish");
+
+    let compiled = graph.compile().unwrap();
+    let final_state = SequentialExecutor.invoke(&compiled, BTreeMap::new()).unwrap();
+    assert_eq!(final_state.get("picked"), Some(&json!("R")));
+}
+
+#[test]
+fn invoke_rejects_invalid_conditional_target_from_router() {
+    let mut graph = StateGraph::new();
+    graph.add_node("router", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_node("left", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("left", "finish").unwrap();
+    graph.add_conditional_edges(
+        "router",
+        ["left"],
+        Arc::new(|_state, _context| Ok(vec![String::from("ghost")])),
+    );
+    graph.set_entry_point("router");
+    graph.set_finish_point("finish");
+
+    let compiled = graph.compile().unwrap();
+    let err = SequentialExecutor.invoke(&compiled, BTreeMap::new()).unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::InvalidConditionalTarget { from, to } if from == "router" && to == "ghost"
+    ));
+}
+
+#[test]
+fn invoke_supports_goto_many_targets() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node_with_runtime(
+            "router",
+            Arc::new(|_state, _context| Ok(NodeOutput::goto_many(BTreeMap::new(), ["left", "right"]))),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "left",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("marks"), json!("L"))]))),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "right",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("marks"), json!("R"))]))),
+        )
+        .unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("left", "finish").unwrap();
+    graph.add_edge("right", "finish").unwrap();
+    graph.add_conditional_edges(
+        "router",
+        ["left", "right"],
+        Arc::new(|_state, _context| Ok(Vec::new())),
+    );
+    graph.set_entry_point("router");
+    graph.set_finish_point("finish");
+    graph.add_channel("marks", Arc::new(langgraph_core::Topic));
+
+    let compiled = graph.compile().unwrap();
+    let result = SequentialExecutor
+        .invoke_with_runtime_context(&compiled, BTreeMap::new(), BTreeMap::new())
+        .unwrap();
+    assert_eq!(result.state.get("marks"), Some(&json!(["L", "R"])));
+}
+
+#[test]
+fn invoke_records_command_trace_for_composed_commands() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node_with_runtime(
+            "router",
+            Arc::new(|_state, _context| {
+                Ok(NodeOutput::from_patch(BTreeMap::new()).with_commands(vec![
+                    Command::Goto(String::from("left")),
+                    Command::GotoMany(vec![String::from("right")]),
+                ]))
+            }),
+        )
+        .unwrap();
+    graph.add_node("left", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_node("right", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("left", "finish").unwrap();
+    graph.add_edge("right", "finish").unwrap();
+    graph.add_conditional_edges(
+        "router",
+        ["left", "right"],
+        Arc::new(|_state, _context| Ok(Vec::new())),
+    );
+    graph.set_entry_point("router");
+    graph.set_finish_point("finish");
+
+    let compiled = graph.compile().unwrap();
+    let result = SequentialExecutor
+        .invoke_with_runtime_context(&compiled, BTreeMap::new(), BTreeMap::new())
+        .unwrap();
+    assert_eq!(result.interrupt, None);
+    assert_eq!(result.metadata.command_trace.len(), 2);
+    assert_eq!(result.metadata.command_trace[0].node, "router");
+    assert_eq!(result.metadata.command_trace[0].superstep, 1);
+    assert!(matches!(
+        result.metadata.command_trace[0].command,
+        Command::Goto(ref target) if target == "left"
+    ));
+    assert!(matches!(
+        result.metadata.command_trace[1].command,
+        Command::GotoMany(ref targets) if targets == &vec![String::from("right")]
+    ));
+}
+
+#[test]
+fn invoke_rejects_goto_many_when_policy_disables_it() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node_with_runtime(
+            "router",
+            Arc::new(|_state, _context| Ok(NodeOutput::goto_many(BTreeMap::new(), ["left", "right"]))),
+        )
+        .unwrap();
+    graph.add_node("left", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_node("right", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("left", "finish").unwrap();
+    graph.add_edge("right", "finish").unwrap();
+    graph.add_conditional_edges(
+        "router",
+        ["left", "right"],
+        Arc::new(|_state, _context| Ok(Vec::new())),
+    );
+    graph.set_entry_point("router");
+    graph.set_finish_point("finish");
+
+    let compiled = graph.compile().unwrap();
+    let policy = CommandPolicy {
+        allow_goto_many: false,
+        ..CommandPolicy::default()
+    };
+    let err = SequentialExecutor
+        .invoke_with_runtime_context_and_policy(
+            &compiled,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            &policy,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        GraphError::CommandRejected { node, .. } if node == "router"
+    ));
+}
+
+#[test]
+fn invoke_rejects_mixed_interrupt_and_routing_when_policy_forbids() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node_with_runtime(
+            "router",
+            Arc::new(|_state, _context| {
+                Ok(NodeOutput::from_patch(BTreeMap::new()).with_commands(vec![
+                    Command::Interrupt,
+                    Command::Goto(String::from("finish")),
+                ]))
+            }),
+        )
+        .unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_conditional_edges("router", ["finish"], Arc::new(|_state, _context| Ok(Vec::new())));
+    graph.set_entry_point("router");
+    graph.set_finish_point("finish");
+
+    let compiled = graph.compile().unwrap();
+    let policy = CommandPolicy {
+        allow_interrupt_with_routing: false,
+        ..CommandPolicy::default()
+    };
+    let err = SequentialExecutor
+        .invoke_with_runtime_context_and_policy(
+            &compiled,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            &policy,
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        GraphError::CommandRejected { node, .. } if node == "router"
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ainvoke_matches_sync_invoke_state_and_metadata() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node(
+            "start",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("events"), json!("seed"))]))),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "middle",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("events"), json!("middle"))]))),
+        )
+        .unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("start", "middle").unwrap();
+    graph.add_edge("middle", "finish").unwrap();
+    graph.set_entry_point("start");
+    graph.set_finish_point("finish");
+    graph.add_channel("events", Arc::new(langgraph_core::Topic));
+
+    let compiled = graph.compile().unwrap();
+    let sync_result = SequentialExecutor.invoke_with_metadata(&compiled, BTreeMap::new()).unwrap();
+    let async_result = SequentialExecutor
+        .ainvoke_with_metadata(&compiled, BTreeMap::new())
+        .await
+        .unwrap();
+
+    assert_eq!(async_result.state, sync_result.state);
+    assert_eq!(async_result.metadata.supersteps, sync_result.metadata.supersteps);
+    assert_eq!(
+        async_result.metadata.versions_seen,
+        sync_result.metadata.versions_seen
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn astream_emits_node_events_state_chunks_and_commands() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node_with_runtime(
+            "router",
+            Arc::new(|_state, _context| {
+                Ok(NodeOutput::from_patch(BTreeMap::from([(String::from("events"), json!("seed"))]))
+                    .with_commands(vec![Command::Goto(String::from("finish"))]))
+            }),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "finish",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("status"), json!("done"))]))),
+        )
+        .unwrap();
+    graph.add_edge("router", "finish").unwrap();
+    graph.set_entry_point("router");
+    graph.set_finish_point("finish");
+    graph.add_channel("events", Arc::new(langgraph_core::Topic));
+
+    let compiled = graph.compile().unwrap();
+    let result = SequentialExecutor.astream(&compiled, BTreeMap::new()).await.unwrap();
+
+    assert_eq!(result.state.get("events"), Some(&json!(["seed"])));
+    assert_eq!(result.state.get("status"), Some(&json!("done")));
+    assert_eq!(result.interrupt, None);
+
+    let has_router_start = result.events.iter().any(|event| {
+        matches!(
+            event,
+            StreamEvent::NodeStarted {
+                node,
+                superstep
+            } if node == "router" && *superstep == 1
+        )
+    });
+    let has_router_finish = result.events.iter().any(|event| {
+        matches!(
+            event,
+            StreamEvent::NodeFinished {
+                node,
+                superstep,
+                ..
+            } if node == "router" && *superstep == 1
+        )
+    });
+    let has_command = result.events.iter().any(|event| {
+        matches!(
+            event,
+            StreamEvent::CommandEmitted {
+                node,
+                superstep,
+                command
+            } if node == "router" && *superstep == 1 && matches!(command, Command::Goto(target) if target == "finish")
+        )
+    });
+    let has_state_chunk = result.events.iter().any(|event| {
+        matches!(
+            event,
+            StreamEvent::StateChunk {
+                superstep,
+                chunk
+            } if *superstep == 1 && chunk.get("events") == Some(&json!(["seed"]))
+        )
+    });
+
+    assert!(has_router_start);
+    assert!(has_router_finish);
+    assert!(has_command);
+    assert!(has_state_chunk);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn astream_emits_interrupt_event_when_node_interrupts() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node_with_runtime(
+            "gate",
+            Arc::new(|_state, _context| {
+                Ok(NodeOutput::interrupt(BTreeMap::from([(
+                    String::from("status"),
+                    json!("paused"),
+                )])))
+            }),
+        )
+        .unwrap();
+    graph.set_entry_point("gate");
+    graph.set_finish_point("gate");
+
+    let compiled = graph.compile().unwrap();
+    let result = SequentialExecutor.astream(&compiled, BTreeMap::new()).await.unwrap();
+
+    assert_eq!(result.interrupt.as_ref().map(|signal| signal.node.as_str()), Some("gate"));
+    let has_interrupt = result.events.iter().any(|event| {
+        matches!(
+            event,
+            StreamEvent::Interrupted {
+                node,
+                superstep
+            } if node == "gate" && *superstep == 1
+        )
+    });
+    assert!(has_interrupt);
 }

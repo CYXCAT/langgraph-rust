@@ -3,14 +3,24 @@ use std::sync::Arc;
 
 use crate::channel::ChannelRef;
 use crate::error::GraphError;
+use crate::runtime::{NodeOutput, RuntimeContext, RuntimeNodeAction};
 use crate::state::{ReducerFn, State, StatePatch};
 
 pub type NodeAction = Arc<dyn Fn(&State) -> Result<StatePatch, String> + Send + Sync>;
+pub type ConditionalRouteFn =
+    Arc<dyn Fn(&State, &RuntimeContext) -> Result<Vec<String>, String> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct ConditionalEdge {
+    pub targets: BTreeSet<String>,
+    pub router: ConditionalRouteFn,
+}
 
 #[derive(Clone)]
 pub struct StateGraph {
-    nodes: BTreeMap<String, NodeAction>,
+    nodes: BTreeMap<String, RuntimeNodeAction>,
     edges: Vec<(String, String)>,
+    conditional_edges: BTreeMap<String, ConditionalEdge>,
     reducers: BTreeMap<String, ReducerFn>,
     channels: BTreeMap<String, ChannelRef>,
     entry_point: Option<String>,
@@ -23,6 +33,7 @@ impl StateGraph {
         Self {
             nodes: BTreeMap::new(),
             edges: Vec::new(),
+            conditional_edges: BTreeMap::new(),
             reducers: BTreeMap::new(),
             channels: BTreeMap::new(),
             entry_point: None,
@@ -34,6 +45,17 @@ impl StateGraph {
         &mut self,
         name: impl Into<String>,
         action: NodeAction,
+    ) -> Result<(), GraphError> {
+        self.add_node_with_runtime(
+            name,
+            Arc::new(move |state, _context| action(state).map(NodeOutput::from_patch)),
+        )
+    }
+
+    pub fn add_node_with_runtime(
+        &mut self,
+        name: impl Into<String>,
+        action: RuntimeNodeAction,
     ) -> Result<(), GraphError> {
         let name = name.into();
         if self.nodes.contains_key(&name) {
@@ -56,6 +78,17 @@ impl StateGraph {
 
     pub fn add_reducer(&mut self, field: impl Into<String>, reducer: ReducerFn) {
         self.reducers.insert(field.into(), reducer);
+    }
+
+    pub fn add_conditional_edges(
+        &mut self,
+        from: impl Into<String>,
+        targets: impl IntoIterator<Item = impl Into<String>>,
+        router: ConditionalRouteFn,
+    ) {
+        let from = from.into();
+        let targets = targets.into_iter().map(Into::into).collect();
+        self.conditional_edges.insert(from, ConditionalEdge { targets, router });
     }
 
     pub fn add_channel(&mut self, field: impl Into<String>, channel: ChannelRef) {
@@ -92,6 +125,24 @@ impl StateGraph {
                 .or_insert_with(|| vec![to.clone()]);
         }
 
+        for (from, conditional) in &self.conditional_edges {
+            if !self.nodes.contains_key(from) {
+                return Err(GraphError::InvalidConditionalSource(from.clone()));
+            }
+            for to in &conditional.targets {
+                if !self.nodes.contains_key(to) {
+                    return Err(GraphError::InvalidConditionalTarget {
+                        from: from.clone(),
+                        to: to.clone(),
+                    });
+                }
+                adjacency
+                    .entry(from.clone())
+                    .and_modify(|nodes| nodes.push(to.clone()))
+                    .or_insert_with(|| vec![to.clone()]);
+            }
+        }
+
         if adjacency.get(&finish).is_some_and(|next| !next.is_empty()) {
             return Err(GraphError::FinishHasOutgoingEdges(finish));
         }
@@ -114,6 +165,7 @@ impl StateGraph {
         Ok(CompiledGraph {
             nodes: self.nodes,
             adjacency,
+            conditional_edges: self.conditional_edges,
             reducers: self.reducers,
             channels: self.channels,
             entry_point: entry,
@@ -130,8 +182,9 @@ impl Default for StateGraph {
 
 #[derive(Clone)]
 pub struct CompiledGraph {
-    pub nodes: BTreeMap<String, NodeAction>,
+    pub nodes: BTreeMap<String, RuntimeNodeAction>,
     pub adjacency: BTreeMap<String, Vec<String>>,
+    pub conditional_edges: BTreeMap<String, ConditionalEdge>,
     pub reducers: BTreeMap<String, ReducerFn>,
     pub channels: BTreeMap<String, ChannelRef>,
     pub entry_point: String,
