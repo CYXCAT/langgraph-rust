@@ -1,0 +1,17 @@
+[package]
+name = "langgraph-pregel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+langgraph-core = { path = "../langgraph-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+insta = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "sequential_executor"
+harness = false
