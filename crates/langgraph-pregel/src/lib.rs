@@ -1,3 +1,3 @@
 pub mod sequential;
 
-pub use sequential::SequentialExecutor;
+pub use sequential::{ExecutionMetadata, ExecutionResult, SequentialExecutor};

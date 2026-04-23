@@ -92,6 +92,10 @@ impl StateGraph {
                 .or_insert_with(|| vec![to.clone()]);
         }
 
+        if adjacency.get(&finish).is_some_and(|next| !next.is_empty()) {
+            return Err(GraphError::FinishHasOutgoingEdges(finish));
+        }
+
         // 预检：finish 必须可从 entry 到达。
         let mut visited = BTreeSet::new();
         let mut stack = vec![entry.clone()];

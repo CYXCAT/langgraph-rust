@@ -1,6 +1,6 @@
 # langgraph-rust
 
-Rust 版 LangGraph 迁移的最小可运行骨架，原项目地址：https://github.com/langchain-ai/langgraph。
+Rust 版 LangGraph 迁移的最小可运行骨架，原项目地址：https://github.com/langchain-ai/langgraph 。
 
 ## 当前进度
 
@@ -16,12 +16,12 @@ Rust 版 LangGraph 迁移的最小可运行骨架，原项目地址：https://gi
 ## 目录
 
 - `crates/langgraph-core`：图模型、状态容器、错误
-- `crates/langgraph-pregel`：顺序执行器（后续替换为 Pregel superstep）
+- `crates/langgraph-pregel`：Pregel 风格 superstep 执行器（当前为同步实现）
 - `crates/langgraph-checkpoint`：checkpoint trait 与内存实现
 - `tests/compat`：跨语言行为对照样例
 
 ## 下一步
 
 1. 在 `langgraph-core` 增加 `add_conditional_edges` 与分支模型
-2. 在 `langgraph-pregel` 引入 channel 抽象和 superstep 调度
+2. 在 checkpoint 保存中接入执行器版本元数据（`versions_seen`）
 3. 为 checkpoint 增加 thread 多轮执行与恢复集成测试

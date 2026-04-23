@@ -1,11 +1,9 @@
 use thiserror::Error;
 
-use crate::types::{Checkpoint, CheckpointId, ThreadId};
+use crate::types::Checkpoint;
 
 #[derive(Debug, Error)]
 pub enum CheckpointError {
-    #[error("checkpoint not found: thread `{thread_id}`, checkpoint `{checkpoint_id}`")]
-    NotFound { thread_id: ThreadId, checkpoint_id: CheckpointId },
     #[error("checkpoint conflict: `{0}`")]
     Conflict(String),
     #[error("storage error: {0}")]

@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use langgraph_checkpoint::{Checkpoint, CheckpointSaver, InMemorySaver, PendingWrite};
+use langgraph_checkpoint::{
+    Checkpoint, CheckpointError, CheckpointSaver, InMemorySaver, PendingWrite,
+};
 use serde_json::json;
 
 #[test]
@@ -23,4 +25,20 @@ fn memory_saver_put_get_list_roundtrip() {
 
     let listed = saver.list("thread-1").unwrap();
     assert_eq!(listed, vec![checkpoint]);
+}
+
+#[test]
+fn memory_saver_rejects_duplicate_checkpoint_id_within_thread() {
+    let saver = InMemorySaver::new();
+    let checkpoint = Checkpoint {
+        thread_id: "thread-1".to_string(),
+        checkpoint_id: "cp-1".to_string(),
+        state: BTreeMap::new(),
+        versions_seen: BTreeMap::new(),
+        pending_writes: vec![],
+    };
+
+    saver.put(checkpoint.clone()).unwrap();
+    let err = saver.put(checkpoint).unwrap_err();
+    assert!(matches!(err, CheckpointError::Conflict(_)));
 }

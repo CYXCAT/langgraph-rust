@@ -10,6 +10,8 @@ pub enum GraphError {
     MissingEntryPoint,
     #[error("missing finish point")]
     MissingFinishPoint,
+    #[error("finish point `{0}` must not have outgoing edges")]
+    FinishHasOutgoingEdges(String),
     #[error("invalid edge: `{from}` -> `{to}`")]
     InvalidEdge { from: String, to: String },
     #[error("ambiguous sequential route from node `{0}`")]

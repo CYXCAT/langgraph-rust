@@ -49,6 +49,23 @@ fn compile_rejects_duplicate_nodes() {
 }
 
 #[test]
+fn compile_rejects_finish_with_outgoing_edges() {
+    let mut graph = StateGraph::new();
+    graph.add_node("start", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_node("tail", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("start", "finish").unwrap();
+    graph.add_edge("finish", "tail").unwrap();
+    graph.set_entry_point("start");
+    graph.set_finish_point("finish");
+
+    assert!(matches!(
+        graph.compile(),
+        Err(GraphError::FinishHasOutgoingEdges(node)) if node == "finish"
+    ));
+}
+
+#[test]
 fn invoke_supports_branch_merge_with_channel_aggregate() {
     let mut graph = StateGraph::new();
     graph.add_node("start", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
@@ -119,4 +136,138 @@ fn invoke_uses_last_value_channel_in_same_superstep() {
     let compiled = graph.compile().unwrap();
     let final_state = SequentialExecutor.invoke(&compiled, BTreeMap::new()).unwrap();
     assert_eq!(final_state.get("status"), Some(&json!("b")));
+}
+
+#[test]
+fn invoke_tracks_channel_versions_across_supersteps() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node(
+            "start",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("events"), json!("seed"))]))),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "middle",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("events"), json!("middle"))]))),
+        )
+        .unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("start", "middle").unwrap();
+    graph.add_edge("middle", "finish").unwrap();
+    graph.set_entry_point("start");
+    graph.set_finish_point("finish");
+    graph.add_channel("events", Arc::new(langgraph_core::Topic));
+
+    let compiled = graph.compile().unwrap();
+    let result = SequentialExecutor.invoke_with_metadata(&compiled, BTreeMap::new()).unwrap();
+
+    assert_eq!(result.state.get("events"), Some(&json!(["seed", "middle"])));
+    assert_eq!(result.metadata.channel_versions.get("events"), Some(&2));
+    assert_eq!(result.metadata.versions_seen.get("events"), Some(&2));
+    assert_eq!(result.metadata.supersteps, 3);
+}
+
+#[test]
+fn invoke_metadata_tracks_only_channel_fields() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node(
+            "start",
+            Arc::new(|_state| {
+                Ok(BTreeMap::from([
+                    (String::from("events"), json!("seed")),
+                    (String::from("note"), json!("v1")),
+                ]))
+            }),
+        )
+        .unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("start", "finish").unwrap();
+    graph.set_entry_point("start");
+    graph.set_finish_point("finish");
+    graph.add_channel("events", Arc::new(langgraph_core::Topic));
+
+    let compiled = graph.compile().unwrap();
+    let result = SequentialExecutor.invoke_with_metadata(&compiled, BTreeMap::new()).unwrap();
+
+    assert_eq!(result.metadata.channel_versions.get("events"), Some(&1));
+    assert_eq!(result.metadata.versions_seen.get("events"), Some(&1));
+    assert_eq!(result.metadata.channel_versions.get("note"), None);
+    assert_eq!(result.metadata.versions_seen.get("note"), None);
+}
+
+#[test]
+fn topic_channel_appends_across_rounds_with_snapshot_consistency() {
+    let mut graph = StateGraph::new();
+    graph
+        .add_node(
+            "start",
+            Arc::new(|_state| Ok(BTreeMap::from([(String::from("events"), json!("seed"))]))),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "branch_a",
+            Arc::new(|state| {
+                let seen = state
+                    .get("events")
+                    .and_then(|value| value.as_array())
+                    .map_or(0, std::vec::Vec::len);
+                Ok(BTreeMap::from([
+                    (String::from("events"), json!("a")),
+                    (String::from("seen_by_a"), json!(seen)),
+                ]))
+            }),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "branch_b",
+            Arc::new(|state| {
+                let seen = state
+                    .get("events")
+                    .and_then(|value| value.as_array())
+                    .map_or(0, std::vec::Vec::len);
+                Ok(BTreeMap::from([
+                    (String::from("events"), json!("b")),
+                    (String::from("seen_by_b"), json!(seen)),
+                ]))
+            }),
+        )
+        .unwrap();
+    graph
+        .add_node(
+            "collector",
+            Arc::new(|state| {
+                let seen = state
+                    .get("events")
+                    .and_then(|value| value.as_array())
+                    .map_or(0, std::vec::Vec::len);
+                Ok(BTreeMap::from([
+                    (String::from("events"), json!("c")),
+                    (String::from("seen_by_collector"), json!(seen)),
+                ]))
+            }),
+        )
+        .unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+
+    graph.add_edge("start", "branch_a").unwrap();
+    graph.add_edge("start", "branch_b").unwrap();
+    graph.add_edge("branch_a", "collector").unwrap();
+    graph.add_edge("branch_b", "collector").unwrap();
+    graph.add_edge("collector", "finish").unwrap();
+    graph.set_entry_point("start");
+    graph.set_finish_point("finish");
+    graph.add_channel("events", Arc::new(langgraph_core::Topic));
+
+    let compiled = graph.compile().unwrap();
+    let final_state = SequentialExecutor.invoke(&compiled, BTreeMap::new()).unwrap();
+
+    assert_eq!(final_state.get("events"), Some(&json!(["seed", "a", "b", "c"])));
+    assert_eq!(final_state.get("seen_by_a"), Some(&json!(1)));
+    assert_eq!(final_state.get("seen_by_b"), Some(&json!(1)));
+    assert_eq!(final_state.get("seen_by_collector"), Some(&json!(3)));
 }

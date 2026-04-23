@@ -6,4 +6,7 @@ pub mod state;
 pub use channel::{BinaryOpFn, BinaryOperatorAggregate, Channel, ChannelRef, LastValue, Topic};
 pub use error::GraphError;
 pub use graph::{CompiledGraph, NodeAction, StateGraph};
-pub use state::{apply_patch, apply_writes, ReducerFn, State, StatePatch, StateValue};
+pub use state::{
+    apply_patch, apply_writes, apply_writes_with_versions, ReducerFn, State, StatePatch,
+    StateValue, VersionMap,
+};

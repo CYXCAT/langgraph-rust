@@ -20,6 +20,12 @@ impl CheckpointSaver for InMemorySaver {
     fn put(&self, checkpoint: Checkpoint) -> Result<(), CheckpointError> {
         let mut guard = self.inner.write().map_err(|e| CheckpointError::Storage(e.to_string()))?;
         let entries = guard.entry(checkpoint.thread_id.clone()).or_insert_with(BTreeMap::new);
+        if entries.contains_key(&checkpoint.checkpoint_id) {
+            return Err(CheckpointError::Conflict(format!(
+                "thread `{}` already has checkpoint `{}`",
+                checkpoint.thread_id, checkpoint.checkpoint_id
+            )));
+        }
         entries.insert(checkpoint.checkpoint_id.clone(), checkpoint);
         Ok(())
     }
