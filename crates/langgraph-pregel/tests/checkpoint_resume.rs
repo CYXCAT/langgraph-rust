@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use langgraph_checkpoint::{Checkpoint, CheckpointError, CheckpointSaver, InMemorySaver, PendingWrite};
+use langgraph_checkpoint::{
+    Checkpoint, CheckpointError, CheckpointSaver, InMemorySaver, PendingWrite,
+};
 use langgraph_core::{Command, NodeOutput, RuntimeContext, StateGraph, Topic};
 use langgraph_pregel::{
     CheckpointBridgeError, CheckpointedSequentialExecutor, StreamEvent, ThreadInvocationOutcome,
+    ThreadStreamEvent,
 };
 use serde_json::json;
 
@@ -34,10 +38,7 @@ fn build_interrupt_graph() -> langgraph_core::CompiledGraph {
                     .get("marker")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("default");
-                Ok(NodeOutput::interrupt(BTreeMap::from([(
-                    String::from("events"),
-                    json!(marker),
-                )])))
+                Ok(NodeOutput::interrupt(BTreeMap::from([(String::from("events"), json!(marker))])))
             }),
         )
         .expect("gate should be inserted");
@@ -60,12 +61,56 @@ impl ReverseListSaver {
     }
 }
 
+struct ConflictOnceSaver {
+    inner: InMemorySaver,
+    injected: AtomicBool,
+}
+
+impl ConflictOnceSaver {
+    fn new() -> Self {
+        Self { inner: InMemorySaver::new(), injected: AtomicBool::new(false) }
+    }
+}
+
+impl CheckpointSaver for ConflictOnceSaver {
+    fn put(&self, checkpoint: Checkpoint) -> Result<(), CheckpointError> {
+        if checkpoint.checkpoint_id == "cp-0001"
+            && self
+                .injected
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.inner.put(checkpoint.clone())?;
+            return Err(CheckpointError::Conflict(String::from(
+                "simulated race on checkpoint id cp-0001",
+            )));
+        }
+        self.inner.put(checkpoint)
+    }
+
+    fn get(
+        &self,
+        thread_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<Option<Checkpoint>, CheckpointError> {
+        self.inner.get(thread_id, checkpoint_id)
+    }
+
+    fn list(&self, thread_id: &str) -> Result<Vec<Checkpoint>, CheckpointError> {
+        self.inner.list(thread_id)
+    }
+}
+
 impl CheckpointSaver for ReverseListSaver {
     fn put(&self, checkpoint: Checkpoint) -> Result<(), CheckpointError> {
         self.inner.put(checkpoint)
     }
 
-    fn get(&self, thread_id: &str, checkpoint_id: &str) -> Result<Option<Checkpoint>, CheckpointError> {
+    fn get(
+        &self,
+        thread_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<Option<Checkpoint>, CheckpointError> {
         self.inner.get(thread_id, checkpoint_id)
     }
 
@@ -76,10 +121,67 @@ impl CheckpointSaver for ReverseListSaver {
     }
 }
 
+#[derive(Default)]
+struct RecordingSaver {
+    inner: InMemorySaver,
+    observed_threads: Mutex<Vec<std::thread::ThreadId>>,
+}
+
+impl RecordingSaver {
+    fn observed_thread_ids(&self) -> Vec<std::thread::ThreadId> {
+        self.observed_threads.lock().expect("recording lock poisoned").clone()
+    }
+
+    fn record_thread(&self) {
+        self.observed_threads
+            .lock()
+            .expect("recording lock poisoned")
+            .push(std::thread::current().id());
+    }
+}
+
+impl CheckpointSaver for RecordingSaver {
+    fn put(&self, checkpoint: Checkpoint) -> Result<(), CheckpointError> {
+        self.record_thread();
+        self.inner.put(checkpoint)
+    }
+
+    fn get(
+        &self,
+        thread_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<Option<Checkpoint>, CheckpointError> {
+        self.record_thread();
+        self.inner.get(thread_id, checkpoint_id)
+    }
+
+    fn list(&self, thread_id: &str) -> Result<Vec<Checkpoint>, CheckpointError> {
+        self.record_thread();
+        self.inner.list(thread_id)
+    }
+}
+
+async fn collect_thread_stream(
+    mut rx: tokio::sync::mpsc::Receiver<Result<ThreadStreamEvent, CheckpointBridgeError>>,
+) -> (Vec<StreamEvent>, String) {
+    let mut events = Vec::<StreamEvent>::new();
+    let mut checkpoint_id: Option<String> = None;
+    while let Some(item) = rx.recv().await {
+        match item.expect("thread stream should not error") {
+            ThreadStreamEvent::Execution(event) => events.push(event),
+            ThreadStreamEvent::CheckpointPersisted { checkpoint_id: persisted } => {
+                checkpoint_id = Some(persisted);
+            }
+        }
+    }
+    let checkpoint_id = checkpoint_id.expect("thread stream should emit checkpoint id");
+    (events, checkpoint_id)
+}
+
 #[test]
 fn checkpoint_records_versions_seen_from_execution_metadata() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let graph = build_topic_round_graph();
 
     let run = runner
@@ -99,16 +201,14 @@ fn checkpoint_records_versions_seen_from_execution_metadata() {
 
 #[test]
 fn resume_latest_continues_thread_and_channel_versions() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let graph = build_topic_round_graph();
 
     let first = runner
         .invoke_thread(&graph, "thread-1", BTreeMap::new())
         .expect("first run should succeed");
-    let second = runner
-        .resume_latest(&graph, "thread-1")
-        .expect("resume should succeed");
+    let second = runner.resume_latest(&graph, "thread-1").expect("resume should succeed");
 
     assert_eq!(first.execution.state.get("events"), Some(&json!(["tick"])));
     assert_eq!(second.execution.state.get("events"), Some(&json!(["tick", "tick"])));
@@ -123,8 +223,8 @@ fn resume_latest_continues_thread_and_channel_versions() {
 
 #[test]
 fn resume_by_checkpoint_id_replays_from_specific_snapshot() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let graph = build_topic_round_graph();
 
     let first = runner
@@ -140,8 +240,8 @@ fn resume_by_checkpoint_id_replays_from_specific_snapshot() {
 
 #[test]
 fn resume_materializes_pending_writes_before_continuing_execution() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let graph = build_topic_round_graph();
 
     let interrupted = Checkpoint {
@@ -154,18 +254,13 @@ fn resume_materializes_pending_writes_before_continuing_execution() {
             patch: BTreeMap::from([(String::from("events"), json!("pending"))]),
         }],
     };
-    saver
-        .put(interrupted)
-        .expect("seed interrupted checkpoint should succeed");
+    saver.put(interrupted).expect("seed interrupted checkpoint should succeed");
 
     let resumed = runner
         .resume_latest(&graph, "thread-2")
         .expect("resume_latest should materialize pending writes");
 
-    assert_eq!(
-        resumed.execution.state.get("events"),
-        Some(&json!(["seed", "pending", "tick"]))
-    );
+    assert_eq!(resumed.execution.state.get("events"), Some(&json!(["seed", "pending", "tick"])));
     assert_eq!(resumed.execution.metadata.versions_seen.get("events"), Some(&3));
 
     let checkpoints = saver.list("thread-2").expect("list should work");
@@ -175,8 +270,8 @@ fn resume_materializes_pending_writes_before_continuing_execution() {
 
 #[test]
 fn interrupt_then_resume_latest_forms_minimal_durable_loop() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let graph = build_topic_round_graph();
 
     let interrupted = runner
@@ -215,8 +310,8 @@ fn interrupt_then_resume_latest_forms_minimal_durable_loop() {
 
 #[test]
 fn resume_latest_uses_numeric_checkpoint_order_instead_of_lexicographic_order() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let graph = build_topic_round_graph();
 
     saver
@@ -248,8 +343,8 @@ fn resume_latest_uses_numeric_checkpoint_order_instead_of_lexicographic_order() 
 
 #[test]
 fn resume_latest_is_stable_even_if_backend_list_order_is_unsorted() {
-    let saver = ReverseListSaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(ReverseListSaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let graph = build_topic_round_graph();
 
     saver
@@ -281,8 +376,8 @@ fn resume_latest_is_stable_even_if_backend_list_order_is_unsorted() {
 
 #[test]
 fn invoke_thread_with_runtime_context_persists_checkpoint_on_interrupt() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let graph = build_interrupt_graph();
 
     let runtime_context = RuntimeContext::from([(String::from("marker"), json!("halt"))]);
@@ -297,10 +392,7 @@ fn invoke_thread_with_runtime_context_persists_checkpoint_on_interrupt() {
     assert_eq!(interrupted.interrupt.node, "gate");
     assert_eq!(interrupted.interrupt.superstep, 1);
     assert_eq!(interrupted.command_trace.len(), 1);
-    assert!(matches!(
-        interrupted.command_trace[0].command,
-        Command::Interrupt
-    ));
+    assert!(matches!(interrupted.command_trace[0].command, Command::Interrupt));
 
     let checkpoint = saver
         .get("thread-6", &interrupted.checkpoint_id)
@@ -313,18 +405,13 @@ fn invoke_thread_with_runtime_context_persists_checkpoint_on_interrupt() {
 
 #[test]
 fn invoke_thread_returns_interrupted_error_and_leaves_resumable_checkpoint() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let graph = build_interrupt_graph();
 
     let error = runner.invoke_thread(&graph, "thread-7", BTreeMap::new()).unwrap_err();
     let checkpoint_id = match error {
-        CheckpointBridgeError::Interrupted {
-            thread_id,
-            checkpoint_id,
-            node,
-            superstep,
-        } => {
+        CheckpointBridgeError::Interrupted { thread_id, checkpoint_id, node, superstep } => {
             assert_eq!(thread_id, "thread-7");
             assert_eq!(node, "gate");
             assert_eq!(superstep, 1);
@@ -343,13 +430,15 @@ fn invoke_thread_returns_interrupted_error_and_leaves_resumable_checkpoint() {
 
 #[test]
 fn command_audit_hook_can_reject_execution_before_checkpoint_persist() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver).with_command_audit_hook(Arc::new(|event| {
-        if matches!(event.command, Command::Interrupt) {
-            return Err(String::from("interrupt not allowed by audit"));
-        }
-        Ok(())
-    }));
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone()).with_command_audit_hook(
+        Arc::new(|event| {
+            if matches!(event.command, Command::Interrupt) {
+                return Err(String::from("interrupt not allowed by audit"));
+            }
+            Ok(())
+        }),
+    );
     let graph = build_interrupt_graph();
 
     let err = runner
@@ -369,10 +458,27 @@ fn command_audit_hook_can_reject_execution_before_checkpoint_persist() {
     assert!(checkpoints.is_empty());
 }
 
+#[test]
+fn invoke_thread_retries_checkpoint_id_on_conflict() {
+    let saver = Arc::new(ConflictOnceSaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
+    let graph = build_topic_round_graph();
+
+    let run = runner
+        .invoke_thread(&graph, "thread-conflict-1", BTreeMap::new())
+        .expect("invoke_thread should retry with a new checkpoint id");
+
+    assert_eq!(run.checkpoint_id, "cp-0002");
+    let checkpoints = saver.list("thread-conflict-1").expect("list should work");
+    assert_eq!(checkpoints.len(), 2);
+    assert!(checkpoints.iter().any(|cp| cp.checkpoint_id == "cp-0001"));
+    assert!(checkpoints.iter().any(|cp| cp.checkpoint_id == "cp-0002"));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn async_checkpoint_bridge_invocation_and_resume_work() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let graph = build_topic_round_graph();
 
     let first = runner
@@ -392,18 +498,28 @@ async fn async_checkpoint_bridge_invocation_and_resume_work() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn async_stream_thread_persists_checkpoint_with_events() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let graph = build_topic_round_graph();
 
-    let streamed = runner
+    let stream = runner
         .astream_thread(&graph, "thread-async-stream-1", BTreeMap::new())
         .await
         .expect("astream_thread should succeed");
+    let (events, checkpoint_id) = collect_thread_stream(stream).await;
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::Completed { state, interrupt, .. } => {
+                Some((state.clone(), interrupt.clone()))
+            }
+            _ => None,
+        })
+        .expect("stream should emit completed event");
 
-    assert_eq!(streamed.execution.state.get("events"), Some(&json!(["tick"])));
-    assert!(streamed.execution.interrupt.is_none());
-    let has_start_event = streamed.execution.events.iter().any(|event| {
+    assert_eq!(completed.0.get("events"), Some(&json!(["tick"])));
+    assert!(completed.1.is_none());
+    let has_start_event = events.iter().any(|event| {
         matches!(
             event,
             StreamEvent::NodeStarted {
@@ -415,7 +531,7 @@ async fn async_stream_thread_persists_checkpoint_with_events() {
     assert!(has_start_event);
 
     let checkpoint = saver
-        .get("thread-async-stream-1", &streamed.checkpoint_id)
+        .get("thread-async-stream-1", &checkpoint_id)
         .expect("lookup should succeed")
         .expect("checkpoint should exist");
     assert_eq!(checkpoint.versions_seen.get("events"), Some(&1));
@@ -424,12 +540,12 @@ async fn async_stream_thread_persists_checkpoint_with_events() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn async_stream_interrupt_persists_checkpoint_and_supports_resume() {
-    let saver = InMemorySaver::new();
-    let runner = CheckpointedSequentialExecutor::new(&saver);
+    let saver = Arc::new(InMemorySaver::new());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
     let interrupt_graph = build_interrupt_graph();
 
     let runtime_context = RuntimeContext::from([(String::from("marker"), json!("stream-halt"))]);
-    let streamed = runner
+    let stream = runner
         .astream_thread_with_runtime_context(
             &interrupt_graph,
             "thread-async-stream-2",
@@ -438,12 +554,19 @@ async fn async_stream_interrupt_persists_checkpoint_and_supports_resume() {
         )
         .await
         .expect("astream interrupt should persist checkpoint");
+    let (events, checkpoint_id) = collect_thread_stream(stream).await;
+    let completed_interrupt = events
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::Completed { interrupt, .. } => {
+                Some(interrupt.as_ref().map(|signal| signal.node.clone()))
+            }
+            _ => None,
+        })
+        .expect("stream should emit completed event");
 
-    assert_eq!(
-        streamed.execution.interrupt.as_ref().map(|signal| signal.node.as_str()),
-        Some("gate")
-    );
-    let has_interrupt_event = streamed.execution.events.iter().any(|event| {
+    assert_eq!(completed_interrupt.as_deref(), Some("gate"));
+    let has_interrupt_event = events.iter().any(|event| {
         matches!(
             event,
             StreamEvent::Interrupted {
@@ -455,7 +578,7 @@ async fn async_stream_interrupt_persists_checkpoint_and_supports_resume() {
     assert!(has_interrupt_event);
 
     let checkpoint = saver
-        .get("thread-async-stream-2", &streamed.checkpoint_id)
+        .get("thread-async-stream-2", &checkpoint_id)
         .expect("lookup should succeed")
         .expect("checkpoint should exist");
     assert_eq!(checkpoint.state.get("events"), Some(&json!(["stream-halt"])));
@@ -465,9 +588,24 @@ async fn async_stream_interrupt_persists_checkpoint_and_supports_resume() {
         .aresume_latest(&build_topic_round_graph(), "thread-async-stream-2")
         .await
         .expect("resume_latest should consume streamed checkpoint");
-    assert_eq!(
-        resumed.execution.state.get("events"),
-        Some(&json!(["stream-halt", "tick"]))
-    );
+    assert_eq!(resumed.execution.state.get("events"), Some(&json!(["stream-halt", "tick"])));
     assert_eq!(resumed.execution.metadata.versions_seen.get("events"), Some(&2));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_bridge_methods_run_blocking_storage_off_runtime_thread() {
+    let saver = Arc::new(RecordingSaver::default());
+    let runner = CheckpointedSequentialExecutor::new(saver.clone());
+    let graph = build_topic_round_graph();
+    let runtime_thread = std::thread::current().id();
+
+    let run = runner
+        .ainvoke_thread(&graph, "thread-async-offload", BTreeMap::new())
+        .await
+        .expect("async invoke should succeed");
+
+    assert_eq!(run.execution.state.get("events"), Some(&json!(["tick"])));
+    let observed_threads = saver.observed_thread_ids();
+    assert!(!observed_threads.is_empty());
+    assert!(observed_threads.iter().all(|thread_id| *thread_id != runtime_thread));
 }

@@ -1,0 +1,13 @@
+[package]
+name = "langgraph-checkpoint-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+langgraph-checkpoint = { path = "../langgraph-checkpoint" }
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

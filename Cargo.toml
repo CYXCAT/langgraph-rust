@@ -3,6 +3,10 @@ members = [
     "crates/langgraph-core",
     "crates/langgraph-pregel",
     "crates/langgraph-checkpoint",
+    "crates/langgraph-checkpoint-sqlite",
+    "crates/langgraph-checkpoint-postgres",
+    "crates/langgraph-prebuilt",
+    "crates/langgraph-cli",
 ]
 resolver = "2"
 

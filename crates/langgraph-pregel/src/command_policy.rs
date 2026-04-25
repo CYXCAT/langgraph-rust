@@ -79,8 +79,5 @@ pub fn resolve_commands(
         ));
     }
 
-    Ok(ResolvedCommands {
-        interrupted,
-        goto_targets,
-    })
+    Ok(ResolvedCommands { interrupted, goto_targets })
 }

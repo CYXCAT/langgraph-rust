@@ -20,30 +20,24 @@ pub struct NodeOutput {
 impl NodeOutput {
     #[must_use]
     pub fn from_patch(patch: StatePatch) -> Self {
-        Self {
-            patch,
-            commands: Vec::new(),
-        }
+        Self { patch, commands: Vec::new() }
     }
 
     #[must_use]
     pub fn interrupt(patch: StatePatch) -> Self {
-        Self {
-            patch,
-            commands: vec![Command::Interrupt],
-        }
+        Self { patch, commands: vec![Command::Interrupt] }
     }
 
     #[must_use]
     pub fn goto(patch: StatePatch, node: impl Into<String>) -> Self {
-        Self {
-            patch,
-            commands: vec![Command::Goto(node.into())],
-        }
+        Self { patch, commands: vec![Command::Goto(node.into())] }
     }
 
     #[must_use]
-    pub fn goto_many(patch: StatePatch, nodes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+    pub fn goto_many(
+        patch: StatePatch,
+        nodes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
         Self {
             patch,
             commands: vec![Command::GotoMany(nodes.into_iter().map(Into::into).collect())],

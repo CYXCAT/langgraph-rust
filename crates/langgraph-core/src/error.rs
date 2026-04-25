@@ -16,6 +16,8 @@ pub enum GraphError {
     InvalidEdge { from: String, to: String },
     #[error("invalid conditional edge source: `{0}`")]
     InvalidConditionalSource(String),
+    #[error("duplicate conditional edge source: `{0}`")]
+    DuplicateConditionalSource(String),
     #[error("invalid conditional edge target from `{from}` to `{to}`")]
     InvalidConditionalTarget { from: String, to: String },
     #[error("ambiguous sequential route from node `{0}`")]
@@ -32,4 +34,6 @@ pub enum GraphError {
     InvalidGotoTarget { node: String, target: String },
     #[error("channel `{field}` merge failed: {reason}")]
     ChannelMergeFailed { field: String, reason: String },
+    #[error("async execution failed: {0}")]
+    AsyncExecutionFailed(String),
 }

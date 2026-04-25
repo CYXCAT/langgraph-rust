@@ -21,6 +21,7 @@ pub struct StateGraph {
     nodes: BTreeMap<String, RuntimeNodeAction>,
     edges: Vec<(String, String)>,
     conditional_edges: BTreeMap<String, ConditionalEdge>,
+    duplicate_conditional_sources: BTreeSet<String>,
     reducers: BTreeMap<String, ReducerFn>,
     channels: BTreeMap<String, ChannelRef>,
     entry_point: Option<String>,
@@ -34,6 +35,7 @@ impl StateGraph {
             nodes: BTreeMap::new(),
             edges: Vec::new(),
             conditional_edges: BTreeMap::new(),
+            duplicate_conditional_sources: BTreeSet::new(),
             reducers: BTreeMap::new(),
             channels: BTreeMap::new(),
             entry_point: None,
@@ -88,6 +90,9 @@ impl StateGraph {
     ) {
         let from = from.into();
         let targets = targets.into_iter().map(Into::into).collect();
+        if self.conditional_edges.contains_key(&from) {
+            self.duplicate_conditional_sources.insert(from.clone());
+        }
         self.conditional_edges.insert(from, ConditionalEdge { targets, router });
     }
 
@@ -104,6 +109,10 @@ impl StateGraph {
     }
 
     pub fn compile(self) -> Result<CompiledGraph, GraphError> {
+        if let Some(duplicate) = self.duplicate_conditional_sources.iter().next() {
+            return Err(GraphError::DuplicateConditionalSource(duplicate.clone()));
+        }
+
         let entry = self.entry_point.ok_or(GraphError::MissingEntryPoint)?;
         let finish = self.finish_point.ok_or(GraphError::MissingFinishPoint)?;
 

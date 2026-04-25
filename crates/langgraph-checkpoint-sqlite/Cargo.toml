@@ -1,0 +1,13 @@
+[package]
+name = "langgraph-checkpoint-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+langgraph-checkpoint = { path = "../langgraph-checkpoint" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -63,10 +63,7 @@ pub fn apply_writes_with_versions(
         if let Some(channel) = channels.get(&key) {
             let merged = channel
                 .merge(state.get(&key), incoming_values)
-                .map_err(|reason| GraphError::ChannelMergeFailed {
-                    field: key.clone(),
-                    reason,
-                })?;
+                .map_err(|reason| GraphError::ChannelMergeFailed { field: key.clone(), reason })?;
             bump_channel_version(channel_versions, versions_seen, &key);
             state.insert(key, merged);
             continue;

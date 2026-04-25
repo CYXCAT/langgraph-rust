@@ -6,10 +6,11 @@ use langgraph_core::{
 };
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 use crate::{
-    CommandPolicy, CommandTraceEvent, ExecutionResult, InterruptSignal, SequentialExecutor,
-    StreamExecutionResult,
+    CommandPolicy, CommandTraceEvent, ExecutionMetadata, ExecutionResult, InterruptSignal,
+    SequentialExecutor, StreamEvent,
 };
 
 #[derive(Debug, Error)]
@@ -19,23 +20,19 @@ pub enum CheckpointBridgeError {
     #[error(transparent)]
     Checkpoint(#[from] CheckpointError),
     #[error("checkpoint `{checkpoint_id}` not found for thread `{thread_id}`")]
-    CheckpointNotFound {
-        thread_id: ThreadId,
-        checkpoint_id: CheckpointId,
-    },
+    CheckpointNotFound { thread_id: ThreadId, checkpoint_id: CheckpointId },
     #[error("thread `{0}` has no checkpoints to resume from")]
     EmptyThread(ThreadId),
     #[error(
         "thread `{thread_id}` interrupted at node `{node}` (superstep {superstep}), persisted as `{checkpoint_id}`"
     )]
-    Interrupted {
-        thread_id: ThreadId,
-        checkpoint_id: CheckpointId,
-        node: String,
-        superstep: usize,
-    },
+    Interrupted { thread_id: ThreadId, checkpoint_id: CheckpointId, node: String, superstep: usize },
     #[error("command audit rejected in thread `{thread_id}`: {reason}")]
     CommandAuditRejected { thread_id: ThreadId, reason: String },
+    #[error("stream ended without completed event in thread `{thread_id}`")]
+    StreamClosedWithoutCompletion { thread_id: ThreadId },
+    #[error("async execution failed: {0}")]
+    AsyncExecutionFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,9 +42,9 @@ pub struct ThreadExecutionResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ThreadStreamResult {
-    pub execution: StreamExecutionResult,
-    pub checkpoint_id: CheckpointId,
+pub enum ThreadStreamEvent {
+    Execution(StreamEvent),
+    CheckpointPersisted { checkpoint_id: CheckpointId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,16 +68,17 @@ pub enum ThreadInvocationOutcome {
 pub type CommandAuditHook =
     Arc<dyn Fn(&CommandTraceEvent) -> Result<(), String> + Send + Sync + 'static>;
 
-pub struct CheckpointedSequentialExecutor<'a> {
+#[derive(Clone)]
+pub struct CheckpointedSequentialExecutor {
     executor: SequentialExecutor,
-    saver: &'a dyn CheckpointSaver,
+    saver: Arc<dyn CheckpointSaver>,
     command_policy: CommandPolicy,
     command_audit_hook: Option<CommandAuditHook>,
 }
 
-impl<'a> CheckpointedSequentialExecutor<'a> {
+impl CheckpointedSequentialExecutor {
     #[must_use]
-    pub fn new(saver: &'a dyn CheckpointSaver) -> Self {
+    pub fn new(saver: Arc<dyn CheckpointSaver>) -> Self {
         Self {
             executor: SequentialExecutor,
             saver,
@@ -116,12 +114,14 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
         )?;
         match outcome {
             ThreadInvocationOutcome::Completed(result) => Ok(result),
-            ThreadInvocationOutcome::Interrupted(result) => Err(CheckpointBridgeError::Interrupted {
-                thread_id,
-                checkpoint_id: result.checkpoint_id,
-                node: result.interrupt.node,
-                superstep: result.interrupt.superstep,
-            }),
+            ThreadInvocationOutcome::Interrupted(result) => {
+                Err(CheckpointBridgeError::Interrupted {
+                    thread_id,
+                    checkpoint_id: result.checkpoint_id,
+                    node: result.interrupt.node,
+                    superstep: result.interrupt.superstep,
+                })
+            }
         }
     }
 
@@ -131,7 +131,12 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
         thread_id: impl Into<ThreadId>,
         state: State,
     ) -> Result<ThreadExecutionResult, CheckpointBridgeError> {
-        self.invoke_thread(graph, thread_id, state)
+        let graph = graph.clone();
+        let runner = self.clone();
+        let thread_id = thread_id.into();
+        tokio::task::spawn_blocking(move || runner.invoke_thread(&graph, thread_id, state))
+            .await
+            .map_err(|err| CheckpointBridgeError::AsyncExecutionFailed(err.to_string()))?
     }
 
     pub fn invoke_thread_with_runtime_context(
@@ -142,15 +147,13 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
         runtime_context: RuntimeContext,
     ) -> Result<ThreadInvocationOutcome, CheckpointBridgeError> {
         let thread_id = thread_id.into();
-        let command_result = self
-            .executor
-            .invoke_with_runtime_context_and_policy(
-                graph,
-                state,
-                runtime_context,
-                VersionMap::new(),
-                &self.command_policy,
-            )?;
+        let command_result = self.executor.invoke_with_runtime_context_and_policy(
+            graph,
+            state,
+            runtime_context,
+            VersionMap::new(),
+            &self.command_policy,
+        )?;
         self.audit_commands(&thread_id, &command_result.metadata.command_trace)?;
         if let Some(interrupt) = command_result.interrupt {
             let metadata = command_result.metadata;
@@ -167,10 +170,8 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
             }));
         }
 
-        let execution = ExecutionResult {
-            state: command_result.state,
-            metadata: command_result.metadata,
-        };
+        let execution =
+            ExecutionResult { state: command_result.state, metadata: command_result.metadata };
         let completed = self.persist_checkpoint(thread_id, execution)?;
         Ok(ThreadInvocationOutcome::Completed(completed))
     }
@@ -182,7 +183,14 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
         state: State,
         runtime_context: RuntimeContext,
     ) -> Result<ThreadInvocationOutcome, CheckpointBridgeError> {
-        self.invoke_thread_with_runtime_context(graph, thread_id, state, runtime_context)
+        let graph = graph.clone();
+        let runner = self.clone();
+        let thread_id = thread_id.into();
+        tokio::task::spawn_blocking(move || {
+            runner.invoke_thread_with_runtime_context(&graph, thread_id, state, runtime_context)
+        })
+        .await
+        .map_err(|err| CheckpointBridgeError::AsyncExecutionFailed(err.to_string()))?
     }
 
     pub fn interrupt_thread(
@@ -202,7 +210,13 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
         versions_seen: VersionMap,
         pending_writes: Vec<PendingWrite>,
     ) -> Result<InterruptedCheckpoint, CheckpointBridgeError> {
-        self.interrupt_thread(thread_id, state, versions_seen, pending_writes)
+        let runner = self.clone();
+        let thread_id = thread_id.into();
+        tokio::task::spawn_blocking(move || {
+            runner.interrupt_thread(thread_id, state, versions_seen, pending_writes)
+        })
+        .await
+        .map_err(|err| CheckpointBridgeError::AsyncExecutionFailed(err.to_string()))?
     }
 
     fn persist_interrupted_checkpoint(
@@ -212,7 +226,8 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
         versions_seen: VersionMap,
         pending_writes: Vec<PendingWrite>,
     ) -> Result<InterruptedCheckpoint, CheckpointBridgeError> {
-        let checkpoint_id = self.persist_state_with_versions(thread_id, state, versions_seen, pending_writes)?;
+        let checkpoint_id =
+            self.persist_state_with_versions(thread_id, state, versions_seen, pending_writes)?;
         Ok(InterruptedCheckpoint { checkpoint_id })
     }
 
@@ -221,7 +236,10 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
         graph: &CompiledGraph,
         thread_id: impl Into<ThreadId>,
         state: State,
-    ) -> Result<ThreadStreamResult, CheckpointBridgeError> {
+    ) -> Result<
+        mpsc::Receiver<Result<ThreadStreamEvent, CheckpointBridgeError>>,
+        CheckpointBridgeError,
+    > {
         self.astream_thread_with_runtime_context(graph, thread_id, state, RuntimeContext::new())
             .await
     }
@@ -232,24 +250,35 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
         thread_id: impl Into<ThreadId>,
         state: State,
         runtime_context: RuntimeContext,
-    ) -> Result<ThreadStreamResult, CheckpointBridgeError> {
+    ) -> Result<
+        mpsc::Receiver<Result<ThreadStreamEvent, CheckpointBridgeError>>,
+        CheckpointBridgeError,
+    > {
         let thread_id = thread_id.into();
-        let execution = self
-            .executor
-            .astream_with_runtime_context_and_policy(
-                graph,
-                state,
-                runtime_context,
-                VersionMap::new(),
-                &self.command_policy,
-            )
-            .await?;
-        self.audit_commands(&thread_id, &execution.metadata.command_trace)?;
-        let checkpoint_id = self.persist_stream_checkpoint(thread_id, &execution)?;
-        Ok(ThreadStreamResult {
-            execution,
-            checkpoint_id,
-        })
+        let graph = graph.clone();
+        let runner = self.clone();
+        let (tx, rx) = mpsc::channel::<Result<ThreadStreamEvent, CheckpointBridgeError>>(64);
+        tokio::spawn(async move {
+            let stream_rx = match runner
+                .executor
+                .astream_with_runtime_context_and_policy(
+                    &graph,
+                    state,
+                    runtime_context,
+                    VersionMap::new(),
+                    &runner.command_policy,
+                )
+                .await
+            {
+                Ok(stream_rx) => stream_rx,
+                Err(err) => {
+                    let _ = tx.send(Err(CheckpointBridgeError::Graph(err))).await;
+                    return;
+                }
+            };
+            runner.forward_stream_and_persist(thread_id, stream_rx, tx).await;
+        });
+        Ok(rx)
     }
 
     pub fn resume(
@@ -260,13 +289,12 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
     ) -> Result<ThreadExecutionResult, CheckpointBridgeError> {
         let thread_id = thread_id.into();
         let checkpoint_id = checkpoint_id.into();
-        let checkpoint = self
-            .saver
-            .get(&thread_id, &checkpoint_id)?
-            .ok_or_else(|| CheckpointBridgeError::CheckpointNotFound {
+        let checkpoint = self.saver.get(&thread_id, &checkpoint_id)?.ok_or_else(|| {
+            CheckpointBridgeError::CheckpointNotFound {
                 thread_id: thread_id.clone(),
                 checkpoint_id: checkpoint_id.clone(),
-            })?;
+            }
+        })?;
         self.resume_from_checkpoint(graph, checkpoint)
     }
 
@@ -276,7 +304,13 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
         thread_id: impl Into<ThreadId>,
         checkpoint_id: impl Into<CheckpointId>,
     ) -> Result<ThreadExecutionResult, CheckpointBridgeError> {
-        self.resume(graph, thread_id, checkpoint_id)
+        let graph = graph.clone();
+        let runner = self.clone();
+        let thread_id = thread_id.into();
+        let checkpoint_id = checkpoint_id.into();
+        tokio::task::spawn_blocking(move || runner.resume(&graph, thread_id, checkpoint_id))
+            .await
+            .map_err(|err| CheckpointBridgeError::AsyncExecutionFailed(err.to_string()))?
     }
 
     pub fn resume_latest(
@@ -296,7 +330,12 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
         graph: &CompiledGraph,
         thread_id: impl Into<ThreadId>,
     ) -> Result<ThreadExecutionResult, CheckpointBridgeError> {
-        self.resume_latest(graph, thread_id)
+        let graph = graph.clone();
+        let runner = self.clone();
+        let thread_id = thread_id.into();
+        tokio::task::spawn_blocking(move || runner.resume_latest(&graph, thread_id))
+            .await
+            .map_err(|err| CheckpointBridgeError::AsyncExecutionFailed(err.to_string()))?
     }
 
     fn resume_from_checkpoint(
@@ -329,10 +368,8 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
                 superstep: interrupt.superstep,
             });
         }
-        let execution = ExecutionResult {
-            state: command_result.state,
-            metadata: command_result.metadata,
-        };
+        let execution =
+            ExecutionResult { state: command_result.state, metadata: command_result.metadata };
         self.persist_checkpoint(thread_id, execution)
     }
 
@@ -363,23 +400,86 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
             execution.metadata.versions_seen.clone(),
             Vec::<PendingWrite>::new(),
         )?;
-        Ok(ThreadExecutionResult {
-            execution,
-            checkpoint_id,
-        })
+        Ok(ThreadExecutionResult { execution, checkpoint_id })
     }
 
     fn persist_stream_checkpoint(
         &self,
         thread_id: ThreadId,
-        execution: &StreamExecutionResult,
+        state: State,
+        metadata: ExecutionMetadata,
     ) -> Result<CheckpointId, CheckpointBridgeError> {
         self.persist_state_with_versions(
             thread_id,
-            execution.state.clone(),
-            execution.metadata.versions_seen.clone(),
+            state,
+            metadata.versions_seen,
             Vec::<PendingWrite>::new(),
         )
+    }
+
+    fn finalize_stream(
+        &self,
+        thread_id: ThreadId,
+        state: State,
+        metadata: ExecutionMetadata,
+    ) -> Result<CheckpointId, CheckpointBridgeError> {
+        self.audit_commands(&thread_id, &metadata.command_trace)?;
+        self.persist_stream_checkpoint(thread_id, state, metadata)
+    }
+
+    async fn forward_stream_and_persist(
+        &self,
+        thread_id: ThreadId,
+        mut stream_rx: mpsc::Receiver<Result<StreamEvent, GraphError>>,
+        tx: mpsc::Sender<Result<ThreadStreamEvent, CheckpointBridgeError>>,
+    ) {
+        let mut completion_state: Option<State> = None;
+        let mut completion_metadata: Option<ExecutionMetadata> = None;
+        while let Some(item) = stream_rx.recv().await {
+            match item {
+                Ok(event) => {
+                    if let StreamEvent::Completed { state, metadata, .. } = &event {
+                        completion_state = Some(state.clone());
+                        completion_metadata = Some(metadata.clone());
+                    }
+                    if tx.send(Ok(ThreadStreamEvent::Execution(event))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(CheckpointBridgeError::Graph(err))).await;
+                    return;
+                }
+            }
+        }
+
+        let (state, metadata) = match (completion_state, completion_metadata) {
+            (Some(state), Some(metadata)) => (state, metadata),
+            _ => {
+                let _ = tx
+                    .send(Err(CheckpointBridgeError::StreamClosedWithoutCompletion { thread_id }))
+                    .await;
+                return;
+            }
+        };
+
+        let runner = self.clone();
+        let thread_for_blocking = thread_id.clone();
+        let persist_result = tokio::task::spawn_blocking(move || {
+            runner.finalize_stream(thread_for_blocking, state, metadata)
+        })
+        .await
+        .map_err(|err| CheckpointBridgeError::AsyncExecutionFailed(err.to_string()))
+        .and_then(|result| result);
+
+        match persist_result {
+            Ok(checkpoint_id) => {
+                let _ = tx.send(Ok(ThreadStreamEvent::CheckpointPersisted { checkpoint_id })).await;
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err)).await;
+            }
+        }
     }
 
     fn persist_state_with_versions(
@@ -389,16 +489,23 @@ impl<'a> CheckpointedSequentialExecutor<'a> {
         versions_seen: VersionMap,
         pending_writes: Vec<PendingWrite>,
     ) -> Result<CheckpointId, CheckpointBridgeError> {
-        let checkpoint_id = self.next_checkpoint_id(&thread_id)?;
-        let checkpoint = Checkpoint {
-            thread_id,
-            checkpoint_id: checkpoint_id.clone(),
-            state,
-            versions_seen,
-            pending_writes,
-        };
-        self.saver.put(checkpoint)?;
-        Ok(checkpoint_id)
+        const MAX_CONFLICT_RETRIES: usize = 8;
+        for attempt in 0..=MAX_CONFLICT_RETRIES {
+            let checkpoint_id = self.next_checkpoint_id(&thread_id)?;
+            let checkpoint = Checkpoint {
+                thread_id: thread_id.clone(),
+                checkpoint_id: checkpoint_id.clone(),
+                state: state.clone(),
+                versions_seen: versions_seen.clone(),
+                pending_writes: pending_writes.clone(),
+            };
+            match self.saver.put(checkpoint) {
+                Ok(()) => return Ok(checkpoint_id),
+                Err(CheckpointError::Conflict(_)) if attempt < MAX_CONFLICT_RETRIES => continue,
+                Err(err) => return Err(CheckpointBridgeError::Checkpoint(err)),
+            }
+        }
+        unreachable!("conflict retry loop must return success or error")
     }
 
     fn next_checkpoint_id(&self, thread_id: &str) -> Result<CheckpointId, CheckpointBridgeError> {
@@ -441,11 +548,7 @@ fn materialize_checkpoint_state(
     let mut channel_versions = checkpoint.versions_seen.clone();
     let mut versions_seen = checkpoint.versions_seen;
     if !checkpoint.pending_writes.is_empty() {
-        let writes = checkpoint
-            .pending_writes
-            .into_iter()
-            .map(|pending| pending.patch)
-            .collect();
+        let writes = checkpoint.pending_writes.into_iter().map(|pending| pending.patch).collect();
         apply_writes_with_versions(
             &mut state,
             writes,

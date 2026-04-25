@@ -7,6 +7,16 @@ use langgraph_core::{
 use langgraph_pregel::{CommandPolicy, SequentialExecutor, StreamEvent};
 use serde_json::json;
 
+async fn collect_stream_events(
+    mut stream: tokio::sync::mpsc::Receiver<Result<StreamEvent, GraphError>>,
+) -> Result<Vec<StreamEvent>, GraphError> {
+    let mut events = Vec::new();
+    while let Some(item) = stream.recv().await {
+        events.push(item?);
+    }
+    Ok(events)
+}
+
 #[test]
 fn invoke_matches_readme_style_example() {
     let mut graph = StateGraph::new();
@@ -64,6 +74,34 @@ fn compile_rejects_finish_with_outgoing_edges() {
     assert!(matches!(
         graph.compile(),
         Err(GraphError::FinishHasOutgoingEdges(node)) if node == "finish"
+    ));
+}
+
+#[test]
+fn compile_rejects_duplicate_conditional_sources() {
+    let mut graph = StateGraph::new();
+    graph.add_node("router", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_node("left", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_node("right", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("left", "finish").unwrap();
+    graph.add_edge("right", "finish").unwrap();
+    graph.add_conditional_edges(
+        "router",
+        ["left"],
+        Arc::new(|_state, _context| Ok(vec![String::from("left")])),
+    );
+    graph.add_conditional_edges(
+        "router",
+        ["right"],
+        Arc::new(|_state, _context| Ok(vec![String::from("right")])),
+    );
+    graph.set_entry_point("router");
+    graph.set_finish_point("finish");
+
+    assert!(matches!(
+        graph.compile(),
+        Err(GraphError::DuplicateConditionalSource(source)) if source == "router"
     ));
 }
 
@@ -362,15 +400,59 @@ fn invoke_with_runtime_context_supports_interrupt_command() {
     graph.set_finish_point("gate");
 
     let compiled = graph.compile().unwrap();
-    let result =
-        SequentialExecutor.invoke_with_runtime_context(&compiled, BTreeMap::new(), BTreeMap::new()).unwrap();
+    let result = SequentialExecutor
+        .invoke_with_runtime_context(&compiled, BTreeMap::new(), BTreeMap::new())
+        .unwrap();
 
     assert_eq!(result.state.get("status"), Some(&json!("paused")));
     assert_eq!(result.interrupt.as_ref().map(|signal| signal.node.as_str()), Some("gate"));
     assert_eq!(result.interrupt.as_ref().map(|signal| signal.superstep), Some(1));
 
-    let interrupted = SequentialExecutor.invoke_with_metadata(&compiled, BTreeMap::new()).unwrap_err();
+    let interrupted =
+        SequentialExecutor.invoke_with_metadata(&compiled, BTreeMap::new()).unwrap_err();
     assert!(matches!(interrupted, GraphError::Interrupted { node } if node == "gate"));
+}
+
+#[test]
+fn interrupt_does_not_skip_other_active_nodes_in_same_superstep() {
+    let mut graph = StateGraph::new();
+    graph.add_node("start", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph
+        .add_node_with_runtime(
+            "a_gate",
+            Arc::new(|_state, _context| {
+                Ok(NodeOutput::interrupt(BTreeMap::from([(String::from("events"), json!("gate"))])))
+            }),
+        )
+        .unwrap();
+    graph
+        .add_node_with_runtime(
+            "z_worker",
+            Arc::new(|_state, _context| {
+                Ok(NodeOutput::from_patch(BTreeMap::from([(
+                    String::from("events"),
+                    json!("worker"),
+                )])))
+            }),
+        )
+        .unwrap();
+    graph.add_node("finish", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
+    graph.add_edge("start", "a_gate").unwrap();
+    graph.add_edge("start", "z_worker").unwrap();
+    graph.add_edge("a_gate", "finish").unwrap();
+    graph.add_edge("z_worker", "finish").unwrap();
+    graph.set_entry_point("start");
+    graph.set_finish_point("finish");
+    graph.add_channel("events", Arc::new(langgraph_core::Topic));
+
+    let compiled = graph.compile().unwrap();
+    let result = SequentialExecutor
+        .invoke_with_runtime_context(&compiled, BTreeMap::new(), BTreeMap::new())
+        .unwrap();
+
+    assert_eq!(result.interrupt.as_ref().map(|signal| signal.node.as_str()), Some("a_gate"));
+    assert_eq!(result.interrupt.as_ref().map(|signal| signal.superstep), Some(2));
+    assert_eq!(result.state.get("events"), Some(&json!(["gate", "worker"])));
 }
 
 #[test]
@@ -380,10 +462,8 @@ fn invoke_supports_conditional_edges_routing() {
         .add_node(
             "router",
             Arc::new(|state| {
-                let route = state
-                    .get("route")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("left");
+                let route =
+                    state.get("route").and_then(serde_json::Value::as_str).unwrap_or("left");
                 Ok(BTreeMap::from([(String::from("route"), json!(route))]))
             }),
         )
@@ -407,10 +487,7 @@ fn invoke_supports_conditional_edges_routing() {
         "router",
         ["left", "right"],
         Arc::new(|state, _context| {
-            let route = state
-                .get("route")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("left");
+            let route = state.get("route").and_then(serde_json::Value::as_str).unwrap_or("left");
             Ok(vec![route.to_string()])
         }),
     );
@@ -489,7 +566,9 @@ fn invoke_supports_goto_many_targets() {
     graph
         .add_node_with_runtime(
             "router",
-            Arc::new(|_state, _context| Ok(NodeOutput::goto_many(BTreeMap::new(), ["left", "right"]))),
+            Arc::new(|_state, _context| {
+                Ok(NodeOutput::goto_many(BTreeMap::new(), ["left", "right"]))
+            }),
         )
         .unwrap();
     graph
@@ -574,7 +653,9 @@ fn invoke_rejects_goto_many_when_policy_disables_it() {
     graph
         .add_node_with_runtime(
             "router",
-            Arc::new(|_state, _context| Ok(NodeOutput::goto_many(BTreeMap::new(), ["left", "right"]))),
+            Arc::new(|_state, _context| {
+                Ok(NodeOutput::goto_many(BTreeMap::new(), ["left", "right"]))
+            }),
         )
         .unwrap();
     graph.add_node("left", Arc::new(|_state| Ok(BTreeMap::new()))).unwrap();
@@ -591,10 +672,7 @@ fn invoke_rejects_goto_many_when_policy_disables_it() {
     graph.set_finish_point("finish");
 
     let compiled = graph.compile().unwrap();
-    let policy = CommandPolicy {
-        allow_goto_many: false,
-        ..CommandPolicy::default()
-    };
+    let policy = CommandPolicy { allow_goto_many: false, ..CommandPolicy::default() };
     let err = SequentialExecutor
         .invoke_with_runtime_context_and_policy(
             &compiled,
@@ -618,10 +696,8 @@ fn invoke_rejects_mixed_interrupt_and_routing_when_policy_forbids() {
         .add_node_with_runtime(
             "router",
             Arc::new(|_state, _context| {
-                Ok(NodeOutput::from_patch(BTreeMap::new()).with_commands(vec![
-                    Command::Interrupt,
-                    Command::Goto(String::from("finish")),
-                ]))
+                Ok(NodeOutput::from_patch(BTreeMap::new())
+                    .with_commands(vec![Command::Interrupt, Command::Goto(String::from("finish"))]))
             }),
         )
         .unwrap();
@@ -631,10 +707,7 @@ fn invoke_rejects_mixed_interrupt_and_routing_when_policy_forbids() {
     graph.set_finish_point("finish");
 
     let compiled = graph.compile().unwrap();
-    let policy = CommandPolicy {
-        allow_interrupt_with_routing: false,
-        ..CommandPolicy::default()
-    };
+    let policy = CommandPolicy { allow_interrupt_with_routing: false, ..CommandPolicy::default() };
     let err = SequentialExecutor
         .invoke_with_runtime_context_and_policy(
             &compiled,
@@ -675,17 +748,12 @@ async fn ainvoke_matches_sync_invoke_state_and_metadata() {
 
     let compiled = graph.compile().unwrap();
     let sync_result = SequentialExecutor.invoke_with_metadata(&compiled, BTreeMap::new()).unwrap();
-    let async_result = SequentialExecutor
-        .ainvoke_with_metadata(&compiled, BTreeMap::new())
-        .await
-        .unwrap();
+    let async_result =
+        SequentialExecutor.ainvoke_with_metadata(&compiled, BTreeMap::new()).await.unwrap();
 
     assert_eq!(async_result.state, sync_result.state);
     assert_eq!(async_result.metadata.supersteps, sync_result.metadata.supersteps);
-    assert_eq!(
-        async_result.metadata.versions_seen,
-        sync_result.metadata.versions_seen
-    );
+    assert_eq!(async_result.metadata.versions_seen, sync_result.metadata.versions_seen);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -695,8 +763,11 @@ async fn astream_emits_node_events_state_chunks_and_commands() {
         .add_node_with_runtime(
             "router",
             Arc::new(|_state, _context| {
-                Ok(NodeOutput::from_patch(BTreeMap::from([(String::from("events"), json!("seed"))]))
-                    .with_commands(vec![Command::Goto(String::from("finish"))]))
+                Ok(NodeOutput::from_patch(BTreeMap::from([(
+                    String::from("events"),
+                    json!("seed"),
+                )]))
+                .with_commands(vec![Command::Goto(String::from("finish"))]))
             }),
         )
         .unwrap();
@@ -712,13 +783,21 @@ async fn astream_emits_node_events_state_chunks_and_commands() {
     graph.add_channel("events", Arc::new(langgraph_core::Topic));
 
     let compiled = graph.compile().unwrap();
-    let result = SequentialExecutor.astream(&compiled, BTreeMap::new()).await.unwrap();
+    let stream = SequentialExecutor.astream(&compiled, BTreeMap::new()).await.unwrap();
+    let events = collect_stream_events(stream).await.unwrap();
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::Completed { state, interrupt, .. } => Some((state, interrupt)),
+            _ => None,
+        })
+        .expect("astream should emit completed event");
 
-    assert_eq!(result.state.get("events"), Some(&json!(["seed"])));
-    assert_eq!(result.state.get("status"), Some(&json!("done")));
-    assert_eq!(result.interrupt, None);
+    assert_eq!(completed.0.get("events"), Some(&json!(["seed"])));
+    assert_eq!(completed.0.get("status"), Some(&json!("done")));
+    assert_eq!(completed.1, &None);
 
-    let has_router_start = result.events.iter().any(|event| {
+    let has_router_start = events.iter().any(|event| {
         matches!(
             event,
             StreamEvent::NodeStarted {
@@ -727,7 +806,7 @@ async fn astream_emits_node_events_state_chunks_and_commands() {
             } if node == "router" && *superstep == 1
         )
     });
-    let has_router_finish = result.events.iter().any(|event| {
+    let has_router_finish = events.iter().any(|event| {
         matches!(
             event,
             StreamEvent::NodeFinished {
@@ -737,7 +816,7 @@ async fn astream_emits_node_events_state_chunks_and_commands() {
             } if node == "router" && *superstep == 1
         )
     });
-    let has_command = result.events.iter().any(|event| {
+    let has_command = events.iter().any(|event| {
         matches!(
             event,
             StreamEvent::CommandEmitted {
@@ -747,7 +826,7 @@ async fn astream_emits_node_events_state_chunks_and_commands() {
             } if node == "router" && *superstep == 1 && matches!(command, Command::Goto(target) if target == "finish")
         )
     });
-    let has_state_chunk = result.events.iter().any(|event| {
+    let has_state_chunk = events.iter().any(|event| {
         matches!(
             event,
             StreamEvent::StateChunk {
@@ -781,10 +860,20 @@ async fn astream_emits_interrupt_event_when_node_interrupts() {
     graph.set_finish_point("gate");
 
     let compiled = graph.compile().unwrap();
-    let result = SequentialExecutor.astream(&compiled, BTreeMap::new()).await.unwrap();
+    let stream = SequentialExecutor.astream(&compiled, BTreeMap::new()).await.unwrap();
+    let events = collect_stream_events(stream).await.unwrap();
+    let completed_interrupt = events
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::Completed { interrupt, .. } => {
+                Some(interrupt.as_ref().map(|i| i.node.as_str()))
+            }
+            _ => None,
+        })
+        .flatten();
 
-    assert_eq!(result.interrupt.as_ref().map(|signal| signal.node.as_str()), Some("gate"));
-    let has_interrupt = result.events.iter().any(|event| {
+    assert_eq!(completed_interrupt, Some("gate"));
+    let has_interrupt = events.iter().any(|event| {
         matches!(
             event,
             StreamEvent::Interrupted {

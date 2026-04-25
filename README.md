@@ -25,16 +25,25 @@ Rust 版 LangGraph 迁移的最小可运行骨架，原项目地址：https://gi
 - [x] Phase 5 第一段：异步入口（`ainvoke` / `aresume` 等）与同步语义对齐测试
 - [x] Phase 5 第二段：`astream` 事件流模型（节点事件 / 状态片段 / 命令与中断事件）
 - [x] Phase 5 第三段：checkpoint bridge thread 维度 `astream`（流式执行 + 自动落盘 + resume 闭环）
+- [x] Phase 6：SQLite / Postgres checkpointer 及跨后端一致性测试
+- [x] Phase 7 第一段：`langgraph-prebuilt` 最小闭环（`ToolNode` / `ValidationNode`）
+- [x] Phase 7 第二段：`ToolNode` 高级能力（路由策略 / 错误策略 / 审计钩子）
+- [x] Phase 7 第三段：`ValidationNode` 结构化规则集 + 可组合验证器 + 最小 `ReAct` 编排 API
+- [x] Phase 7 第四段：默认 `planner/tool-calling` 模板 API（基于 `ReactAgentBuilder` 封装）
+- [x] Phase 7 第五段：默认模板多工具策略（主工具 + 选择器 + 回退工具）
+- [x] Phase 8 第一段：最小 `langgraph-cli`（JSON 输入 -> 执行 -> JSON 输出）
 
 ## 目录
 
 - `crates/langgraph-core`：图模型、状态容器、错误
 - `crates/langgraph-pregel`：Pregel 风格 superstep 执行器（同步 + 异步入口）
 - `crates/langgraph-checkpoint`：checkpoint trait 与内存实现
+- `crates/langgraph-prebuilt`：预置高层节点（`ToolNode` / `ValidationNode` / `react` / `react_template`）
+- `crates/langgraph-cli`：最小命令行骨架（`run` 子命令，支持 stdin/文件输入与 JSON 输出）
 - `tests/compat`：跨语言行为对照样例
 
 ## 下一步
 
-1. 继续 Phase 5：细化流式事件协议（完成事件、错误事件、可选过滤器）
-2. 进入 Phase 6：实现 SQLite checkpointer 与基础 schema 迁移
-3. 扩展 Phase 6：补齐 Postgres checkpointer 与集成测试
+1. 为 `langgraph-cli` 补充更多图预设与输入校验提示（提升可用性）
+2. 为 prebuilt 新能力补充示例文档（模板接入、策略组合、验证报告消费方式）
+3. 评估 `ToolNode`/`ValidationNode`/`react_template` 在流式事件中的可观测字段标准化

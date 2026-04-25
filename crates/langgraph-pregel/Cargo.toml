@@ -9,11 +9,15 @@ langgraph-core = { path = "../langgraph-core" }
 langgraph-checkpoint = { path = "../langgraph-checkpoint" }
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
 insta = "1"
 criterion = "0.5"
 tokio = { version = "1", features = ["macros", "rt"] }
+langgraph-checkpoint-sqlite = { path = "../langgraph-checkpoint-sqlite" }
+langgraph-checkpoint-postgres = { path = "../langgraph-checkpoint-postgres" }
+tempfile = "3"
 
 [[bench]]
 name = "sequential_executor"
